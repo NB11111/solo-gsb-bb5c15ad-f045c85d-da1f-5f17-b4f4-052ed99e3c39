@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date as date_cls, datetime, timezone
 from decimal import Decimal
 from fractions import Fraction
 from typing import List, Literal, Optional, Union
@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core import (
+    REASON_NO_FEASIBLE_ALLOCATION,
     REASON_TOTAL_INCOMPATIBLE_MODULUS,
     REASON_TOTAL_OUT_OF_RANGE,
     STATUS_AMBIGUOUS,
@@ -18,16 +19,18 @@ from app.core import (
     STATUS_NO_SOLUTION,
     STATUS_OK,
     reconcile_total,
+    solve_daily_segment,
     solve_segment,
 )
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
-        "整条序列的回绕次数总和，仅确定圈数已唯一的分段用量。"
+        "整条序列的回绕次数总和，仅确定圈数已唯一的分段用量；"
+        "还支持按 UTC 自然日给出覆盖时段内每日最小/最大可行整数用量。"
     ),
 )
 
@@ -91,6 +94,10 @@ class ReconcileRequest(_BaseUsageRequest):
     total_usage: int = Field(
         ge=0, description="账单总用量（非负整数）"
     )
+
+
+class DailyRangeRequest(_BaseUsageRequest):
+    """按 UTC 自然日的每日用量上下界请求（读数/模数/速率校验与其他接口一致）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +210,63 @@ class ReconcileResponse(BaseModel):
     conflicts: List[
         Union[ReconcileSegmentErrorOut, ReconcileTotalErrorOut]
     ] = Field(description="冲突明细：某段原本无解，或账单总量与模数不相容/超界")
+
+
+# ---------------------------------------------------------------------------
+# 每日用量上下界接口响应模型
+# ---------------------------------------------------------------------------
+
+# 每日边界的独立性说明：逐日边际极值，不保证跨日同时达到
+DAILY_BOUNDARY_NOTE = (
+    "每个 UTC 自然日的 min_usage/max_usage 均可由某个可行的回绕次数及"
+    "子段整数分配分别达到；不同日期（以及同一读数区间内各子段）的上界"
+    "不保证存在同一个分配同时成立，请勿将各日上界相加后作为整体上界使用"
+)
+
+
+class DailyUsageOut(BaseModel):
+    date: date_cls = Field(description="UTC 自然日")
+    min_usage: int = Field(
+        description="当日所有落在该日的子段用量下界之和（非负整数，可达到）"
+    )
+    max_usage: int = Field(
+        description="当日所有落在该日的子段用量上界之和（非负整数，可达到）"
+    )
+    segment_count: int = Field(
+        description="当日覆盖到的读数区间子段数（同一区间至多贡献一个子段）"
+    )
+
+
+class DailyRangeConflictOut(BaseModel):
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    reason: Literal["no_feasible_allocation"]
+    detail: str
+    min_wraps: int = Field(description="满足非负增量约束的最小回绕次数")
+    max_wraps: int = Field(
+        description="满足跨日子段总容量约束的最大回绕次数；小于 min_wraps 表示无解"
+    )
+    total_capacity: int = Field(
+        description="区间内各 UTC 日子段容量 floor(速率×秒数) 之和"
+    )
+
+
+class DailyRangeResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    days: List[DailyUsageOut] = Field(
+        description="覆盖时段内各 UTC 自然日的最小/最大可行整数用量；冲突时为空"
+    )
+    boundary_note: str = Field(
+        description="每日边界可分别达到、不保证各日上界同时成立的说明"
+    )
+    conflicts: List[DailyRangeConflictOut] = Field(
+        description="不存在可行子段分配的读数区间及冲突原因；非空时 days 为空"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -406,5 +470,87 @@ def reconcile_usage(req: ReconcileRequest) -> ReconcileResponse:
         total_usage=req.total_usage,
         total_wraps=result.total_wraps,
         segments=segments,
+        conflicts=[],
+    )
+
+
+@app.post("/v1/usage/daily-range", response_model=DailyRangeResponse)
+def daily_usage_range(req: DailyRangeRequest) -> DailyRangeResponse:
+    """按 UTC 自然日给出覆盖时段内每日最小/最大可行整数用量。
+
+    复用读数、模数、最大每秒速率的请求校验；相邻读数跨 UTC 午夜时按
+    午夜切成子段，子段容量为 ``floor(max_rate_per_second × 秒数)``，
+    区间总增量 ``读数差 + k×模数`` 须能以非负整数分配到各子段。
+    """
+    max_rate = Fraction(req.max_rate_per_second)
+    conflicts: List[DailyRangeConflictOut] = []
+    # day -> [下界之和, 上界之和, 子段数]
+    day_acc: "dict[date_cls, list[int]]" = {}
+
+    for i, (a, b) in enumerate(zip(req.readings, req.readings[1:])):
+        result = solve_daily_segment(
+            i, a.value, b.value, a.timestamp, b.timestamp, req.modulus, max_rate
+        )
+        elapsed = int((b.timestamp - a.timestamp).total_seconds())
+
+        if not result.feasible:
+            diff = b.value - a.value
+            min_delta = diff + result.min_wraps * req.modulus
+            detail = (
+                f"无可行分配：该区间按 UTC 午夜切成 {len(result.subsegments)} 段，"
+                f"各子段容量 floor(速率×秒数) 之和为 {result.total_capacity}，"
+                f"而满足非负增量的最小总增量已为 {min_delta}"
+                f"（读数差 {diff} + {result.min_wraps}×{req.modulus}）；"
+                f"回绕次数需同时满足 k>={result.min_wraps} 与 k<={result.max_wraps}，"
+                f"区间为空，无法把整数增量分配到各日子段"
+            )
+            conflicts.append(
+                DailyRangeConflictOut(
+                    index=i,
+                    start_timestamp=a.timestamp,
+                    end_timestamp=b.timestamp,
+                    start_reading=a.value,
+                    end_reading=b.value,
+                    elapsed_seconds=elapsed,
+                    reason=REASON_NO_FEASIBLE_ALLOCATION,  # type: ignore[arg-type]
+                    detail=detail,
+                    min_wraps=result.min_wraps,
+                    max_wraps=result.max_wraps,
+                    total_capacity=result.total_capacity,
+                )
+            )
+            continue
+
+        for seg, low, high in zip(
+            result.subsegments, result.min_usages, result.max_usages
+        ):
+            acc = day_acc.setdefault(seg.day, [0, 0, 0])
+            acc[0] += low
+            acc[1] += high
+            acc[2] += 1
+
+    if conflicts:
+        return DailyRangeResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            days=[],
+            boundary_note=DAILY_BOUNDARY_NOTE,
+            conflicts=conflicts,
+        )
+
+    days = [
+        DailyUsageOut(
+            date=day,
+            min_usage=acc[0],
+            max_usage=acc[1],
+            segment_count=acc[2],
+        )
+        for day, acc in sorted(day_acc.items())
+    ]
+    return DailyRangeResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        days=days,
+        boundary_note=DAILY_BOUNDARY_NOTE,
         conflicts=[],
     )

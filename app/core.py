@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from fractions import Fraction
 from typing import Optional, Sequence, Tuple
 
@@ -47,6 +48,8 @@ STATUS_CONFLICT = "conflict"
 # 账单总量对账冲突原因
 REASON_TOTAL_INCOMPATIBLE_MODULUS = "total_incompatible_modulus"
 REASON_TOTAL_OUT_OF_RANGE = "total_out_of_range"
+# 跨日分配冲突原因：不存在可行的子段整数分配
+REASON_NO_FEASIBLE_ALLOCATION = "no_feasible_allocation"
 
 
 @dataclass(frozen=True)
@@ -219,4 +222,140 @@ def reconcile_total(
         conflicts=(),
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 跨日用量上下界（daily-range）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DaySubsegment:
+    """读数区间按 UTC 午夜切出的一个子段（完全落在单个 UTC 自然日内）。"""
+
+    day: date
+    seconds: int
+    capacity: int  # floor(max_rate_per_second * seconds)
+
+
+@dataclass(frozen=True)
+class DailySegmentResult:
+    """一个读数区间跨日切分后的可行分配结果。"""
+
+    index: int
+    feasible: bool
+    # 该区间可行的回绕次数范围；无解时 max_wraps < min_wraps
+    min_wraps: int
+    max_wraps: int
+    subsegments: Tuple[DaySubsegment, ...]
+    # 每个子段的精确边际上下界（与 subsegments 一一对应）；无解时为空
+    min_usages: Tuple[int, ...]
+    max_usages: Tuple[int, ...]
+
+    @property
+    def total_capacity(self) -> int:
+        return sum(s.capacity for s in self.subsegments)
+
+
+def split_utc_days(start: datetime, end: datetime) -> Tuple[Tuple[date, int], ...]:
+    """将 [start, end) 按 UTC 午夜切成 ``(UTC 日期, 该日子段秒数)`` 序列。
+
+    端点均为秒精度、带时区的严格递增时间戳。子段在交界处首尾相接
+    （零长度子段被丢弃），秒数之和恰为区间总时长。
+    """
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    pieces = []
+    cursor = start
+    while cursor < end:
+        next_midnight = datetime.combine(
+            cursor.date() + timedelta(days=1), time.min, tzinfo=timezone.utc
+        )
+        boundary = min(end, next_midnight)
+        seconds = int((boundary - cursor).total_seconds())
+        if seconds > 0:
+            pieces.append((cursor.date(), seconds))
+        cursor = boundary
+    return tuple(pieces)
+
+
+def solve_daily_segment(
+    index: int,
+    start_value: int,
+    end_value: int,
+    start: datetime,
+    end: datetime,
+    modulus: int,
+    max_rate_per_second: Fraction,
+) -> DailySegmentResult:
+    """求单个读数区间跨各 UTC 日子段用量的精确边际上下界。
+
+    区间真实增量为 ``delta = diff + k*M``（diff = r2 - r1，k >= 0 整数），
+    切日子段容量为 ``c_j = floor(rate * s_j)``。需存在非负整数分配
+    ``(x_1, ..., x_n)`` 满足 ``0 <= x_j <= c_j`` 且 ``Σ x_j = delta``。
+
+    该类分配存在当且仅当 ``delta <= C``（``C = Σ c_j``）：因为所有容量为
+    整数，``[0, C]`` 内任意整数总量都可逐子段填满。故可行 k 仍为连续
+    整数区间 ``[k_min, k_max]``，其中
+
+        k_min = ceil(max(0, -diff) / M)
+        k_max = floor((C - diff) / M)
+
+    对固定子段 j，给定可行 k 时其边际范围为
+
+        max(0, delta - (C - c_j)) <= x_j <= min(c_j, delta)
+
+    下界随 delta 单调增，故全区间最小值在 k_min 处取得；上界随 delta
+    单调增，最大值在 k_max 处取得。两端点均确实可由完整分配达到
+    （箱型可行域与固定总量超平面之交的逐分量极值）。
+    """
+    diff = end_value - start_value
+
+    subsegments = tuple(
+        DaySubsegment(
+            day=day,
+            seconds=seconds,
+            # Fraction 精确取整，避免浮点边界误差
+            capacity=math.floor(max_rate_per_second * seconds),
+        )
+        for day, seconds in split_utc_days(start, end)
+    )
+    total_capacity = sum(s.capacity for s in subsegments)
+
+    k_min = 0 if diff >= 0 else (-diff + modulus - 1) // modulus
+    k_max = (total_capacity - diff) // modulus
+
+    if k_max < k_min:
+        return DailySegmentResult(
+            index=index,
+            feasible=False,
+            min_wraps=k_min,
+            max_wraps=k_max,
+            subsegments=subsegments,
+            min_usages=(),
+            max_usages=(),
+        )
+
+    delta_min = diff + k_min * modulus
+    delta_max = diff + k_max * modulus
+
+    min_usages, max_usages = [], []
+    for s in subsegments:
+        other_capacity = total_capacity - s.capacity
+        # x_j >= delta - 其余子段容量之和；delta 取最小时下界最小
+        low = max(0, delta_min - other_capacity)
+        # x_j <= delta（且不超本段子容量）；delta 取最大时上界最大
+        high = min(s.capacity, delta_max)
+        min_usages.append(low)
+        max_usages.append(high)
+
+    return DailySegmentResult(
+        index=index,
+        feasible=True,
+        min_wraps=k_min,
+        max_wraps=k_max,
+        subsegments=subsegments,
+        min_usages=tuple(min_usages),
+        max_usages=tuple(max_usages),
     )
