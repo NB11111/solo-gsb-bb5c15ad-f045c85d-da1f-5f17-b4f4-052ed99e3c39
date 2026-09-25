@@ -30,6 +30,28 @@
         hi_i' = min(hi_i, K - Σ_j lo_j + lo_i)
 
     lo_i' == hi_i' 的段圈数唯一，可确定用量；其余段仅保留范围，不猜测。
+
+按日用量范围（daily_subsegment_bounds）：
+    相邻读数区间按 UTC 午夜切成子段，子段 j 时长 s_j 秒，容量
+    c_j = floor(max_rate * s_j)（该子段内可容纳的最大整数增量），
+    总容量 C = Σ c_j。区间总增量 Δ = diff + k*M（k 为非负整数）须能
+    分配到各子段：x_j 为非负整数、x_j <= c_j 且 Σ x_j = Δ。由于各子段
+    仅有各自容量上界，分配存在当且仅当 0 <= Δ <= C，即可行 k 构成
+    连续整数区间 [k_min, k_max]：
+
+        k_min = 满足 diff + k*M >= 0 的最小非负整数
+        k_max = floor((C - diff) / M)
+
+    k_max < k_min 时该区间无可行分配。可行时，子段 j 的用量 x_j 在某个
+    可行 k 及其余子段分配下的精确上下界为：
+
+        lo_j = max(0, diff + k_min*M - (C - c_j))   （其余子段尽量装满）
+        hi_j = min(c_j, diff + k_max*M)             （本段尽量装满）
+
+    两个界分别由 k = k_min / k_max 取到，且同一读数区间内各子段的下界
+    （或上界）可同时成立；不同读数区间之间亦然。但跨 UTC 自然日的上界
+    一般不能同时成立（如日 A 取上界要求 Δ 偏向日 A，则日 B 只能取下界），
+    调用方不得将各日上界直接相加。
 """
 
 from __future__ import annotations
@@ -219,4 +241,107 @@ def reconcile_total(
         conflicts=(),
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
+    )
+
+
+@dataclass(frozen=True)
+class SubSegmentBound:
+    """单个 UTC 日子段的用量上下界（各自可达到，见模块 docstring）。"""
+
+    part_index: int  # 在读数区间内按时间排列的子段序号（0 起）
+    elapsed_seconds: int  # 子段时长（秒，>= 1）
+    capacity: int  # floor(max_rate * 时长)，该子段可容纳的最大整数增量
+    min_usage: int  # 某个可行 k 及其余子段分配下，该子段用量的精确下界
+    max_usage: int  # 某个可行 k 及其余子段分配下，该子段用量的精确上界
+
+
+@dataclass(frozen=True)
+class IntervalDailyResult:
+    """一个相邻读数区间的按日子段拆分与可行性判定结果。"""
+
+    index: int
+    diff: int  # 首尾读数差 r2 - r1
+    total_capacity: int  # 各子段容量之和 C
+    min_wraps: int  # 满足非负总增量的最小回绕次数 k_min
+    max_wraps: int  # 满足总容量约束的最大回绕次数 k_max；无可行分配时 < k_min
+    parts: Tuple[SubSegmentBound, ...]  # 无可行分配时为空
+
+    @property
+    def feasible(self) -> bool:
+        """是否存在可行分配（某个 k 使总增量可分配到各子段）。"""
+        return self.max_wraps >= self.min_wraps
+
+
+def daily_subsegment_bounds(
+    index: int,
+    start_value: int,
+    end_value: int,
+    subsegment_seconds: Sequence[int],
+    modulus: int,
+    max_rate_per_second: Fraction,
+) -> IntervalDailyResult:
+    """按 UTC 午夜拆分后的子段，求读数区间在各子段上的精确用量上下界。
+
+    :param index: 读数区间序号（0 起）
+    :param start_value: 区间起始读数
+    :param end_value: 区间结束读数
+    :param subsegment_seconds: 午夜切分后的各子段时长（秒，均 >= 1，按时间排列）
+    :param modulus: 计数器模数
+    :param max_rate_per_second: 每秒最大计数增量（精确分数）
+    :return: 判定结果；``feasible`` 为 False 时 ``parts`` 为空
+    """
+    if not subsegment_seconds or any(s <= 0 for s in subsegment_seconds):
+        raise ValueError("子段时长必须为非空正整数序列")
+
+    diff = end_value - start_value
+    capacities = [
+        math.floor(max_rate_per_second * s) for s in subsegment_seconds
+    ]
+    total_capacity = sum(capacities)
+
+    # k_min: diff + k*M >= 0 的最小非负整数 k
+    if diff >= 0:
+        k_min = 0
+    else:
+        # ceil(-diff / M)，此时 0 < -diff < M，结果恒为 1
+        k_min = (-diff + modulus - 1) // modulus
+
+    # k_max: diff + k*M <= C 的最大整数 k（C 为各子段容量之和）
+    k_max = math.floor((total_capacity - diff) / modulus)
+
+    if k_max < k_min:
+        return IntervalDailyResult(
+            index=index,
+            diff=diff,
+            total_capacity=total_capacity,
+            min_wraps=k_min,
+            max_wraps=k_max,
+            parts=(),
+        )
+
+    delta_min = diff + k_min * modulus  # 最小可行总增量（>= 0）
+    delta_max = diff + k_max * modulus  # 最大可行总增量（<= C）
+    parts = []
+    for j, (seconds, capacity) in enumerate(zip(subsegment_seconds, capacities)):
+        # 下界：其余子段容量之和装不下 delta_min 的部分必须落在本段
+        lo = max(0, delta_min - (total_capacity - capacity))
+        # 上界：本段容量与最大可行总增量的较小者
+        hi = min(capacity, delta_max)
+        parts.append(
+            SubSegmentBound(
+                part_index=j,
+                elapsed_seconds=seconds,
+                capacity=capacity,
+                min_usage=lo,
+                max_usage=hi,
+            )
+        )
+
+    return IntervalDailyResult(
+        index=index,
+        diff=diff,
+        total_capacity=total_capacity,
+        min_wraps=k_min,
+        max_wraps=k_max,
+        parts=tuple(parts),
     )
